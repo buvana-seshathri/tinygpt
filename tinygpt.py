@@ -32,7 +32,9 @@ val_data = data[n:]
 # ---- 2. Batching ----
 block_size = 32  # how many characters of context we look at (bigger now - attention can use it)
 batch_size = 32  # how many sequences we train on at once
-n_embd = 32      # size of each character's embedding vector
+n_embd = 64      # size of each character's embedding vector
+n_layer = 4      # how many transformer blocks to stack
+n_head = 4       # how many attention heads per block
 
 def get_batch(split):
     d = train_data if split == "train" else val_data
@@ -121,13 +123,13 @@ class Block(nn.Module):
         x = x + self.ffwd(self.ln2(x))   # think, then add back to x
         return x
 
-# ---- 7. Full model: embeddings + transformer block + output layer ----
+# ---- 7. Full model: embeddings + stacked transformer blocks + output layer ----
 class AttentionModel(nn.Module):
-    def __init__(self, vocab_size, n_embd, block_size, num_heads=4):
+    def __init__(self, vocab_size, n_embd, block_size, n_head, n_layer):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, n_embd)
         self.position_embedding = nn.Embedding(block_size, n_embd)
-        self.block = Block(n_embd, num_heads, block_size)
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head, block_size) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
         self.block_size = block_size
@@ -137,7 +139,7 @@ class AttentionModel(nn.Module):
         tok_emb = self.token_embedding(idx)                          # (B, T, n_embd) - "what character is this"
         pos_emb = self.position_embedding(torch.arange(T))           # (T, n_embd)    - "where in the sequence"
         x = tok_emb + pos_emb                                        # combine identity + position
-        x = self.block(x)                                            # attend + think
+        x = self.blocks(x)                                           # attend + think, n_layer times
         x = self.ln_f(x)
         logits = self.lm_head(x)                                     # (B, T, vocab_size)
 
@@ -159,25 +161,41 @@ class AttentionModel(nn.Module):
             idx = torch.cat([idx, next_idx], dim=1)
         return idx
 
-# ---- 8. Train ----
-model = AttentionModel(vocab_size, n_embd, block_size)
+# ---- 8. Estimate loss (averaged over several batches, no gradient tracking) ----
+eval_iters = 100
+
+@torch.no_grad()
+def estimate_loss(model):
+    out = {}
+    model.eval()
+    for split in ["train", "val"]:
+        losses = torch.zeros(eval_iters)
+        for i in range(eval_iters):
+            xb, yb = get_batch(split)
+            _, loss = model(xb, yb)
+            losses[i] = loss.item()
+        out[split] = losses.mean().item()
+    model.train()
+    return out
+
+# ---- 9. Train ----
+model = AttentionModel(vocab_size, n_embd, block_size, n_head, n_layer)
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
 steps = 5000
 for step in range(steps):
+    if step % 500 == 0 or step == steps - 1:
+        losses = estimate_loss(model)
+        print(f"step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+
     xb, yb = get_batch("train")
     logits, loss = model(xb, yb)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
 
-    if step % 500 == 0:
-        print(f"step {step}: loss {loss.item():.4f}")
-
-print(f"final loss: {loss.item():.4f}")
-
-# ---- 9. Generate sample text ----
+# ---- 10. Generate sample text ----
 context = torch.zeros((1, 1), dtype=torch.long)  # start with newline char
-generated = model.generate(context, max_new_tokens=300)
+generated = model.generate(context, max_new_tokens=500)
 print("\n--- sample output ---")
 print(decode(generated[0].tolist()))
