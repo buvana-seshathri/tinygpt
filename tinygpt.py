@@ -69,13 +69,66 @@ class Head(nn.Module):
         out = weights @ v   # (B, T, head_size) - weighted average of Values
         return out
 
-# ---- 4. Full model: embeddings + attention head + output layer ----
+# ---- 4. Multiple heads in parallel, then combine ----
+class MultiHeadAttention(nn.Module):
+    """Runs several attention heads side by side, each with a smaller
+    head_size, then concatenates their outputs back to n_embd size.
+    Each head is free to learn a different pattern - e.g. one might
+    focus on the previous vowel, another on sentence starts, etc."""
+
+    def __init__(self, n_embd, num_heads, block_size):
+        super().__init__()
+        head_size = n_embd // num_heads
+        self.heads = nn.ModuleList([Head(n_embd, head_size, block_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)  # mixes the heads' outputs back together
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)  # (B, T, n_embd)
+        return self.proj(out)
+
+# ---- 5. Feed-forward: lets the model "think" per position ----
+class FeedForward(nn.Module):
+    """Attention gathers information from other positions.
+    This is where the model processes that information - a plain
+    2-layer MLP applied independently to each position."""
+
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+# ---- 6. Transformer block: attention + feedforward + residuals + norm ----
+class Block(nn.Module):
+    """One transformer block. The 'x = x +' pattern is a residual
+    connection: the sublayer only has to learn what to ADD to x,
+    which makes training much easier than learning a full replacement."""
+
+    def __init__(self, n_embd, num_heads, block_size):
+        super().__init__()
+        self.sa = MultiHeadAttention(n_embd, num_heads, block_size)
+        self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))     # attend, then add back to x
+        x = x + self.ffwd(self.ln2(x))   # think, then add back to x
+        return x
+
+# ---- 7. Full model: embeddings + transformer block + output layer ----
 class AttentionModel(nn.Module):
-    def __init__(self, vocab_size, n_embd, block_size):
+    def __init__(self, vocab_size, n_embd, block_size, num_heads=4):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, n_embd)
         self.position_embedding = nn.Embedding(block_size, n_embd)
-        self.sa_head = Head(n_embd, head_size=n_embd, block_size=block_size)
+        self.block = Block(n_embd, num_heads, block_size)
+        self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
         self.block_size = block_size
 
@@ -84,7 +137,8 @@ class AttentionModel(nn.Module):
         tok_emb = self.token_embedding(idx)                          # (B, T, n_embd) - "what character is this"
         pos_emb = self.position_embedding(torch.arange(T))           # (T, n_embd)    - "where in the sequence"
         x = tok_emb + pos_emb                                        # combine identity + position
-        x = self.sa_head(x)                                          # let positions gather context from each other
+        x = self.block(x)                                            # attend + think
+        x = self.ln_f(x)
         logits = self.lm_head(x)                                     # (B, T, vocab_size)
 
         if targets is None:
@@ -105,7 +159,7 @@ class AttentionModel(nn.Module):
             idx = torch.cat([idx, next_idx], dim=1)
         return idx
 
-# ---- 5. Train ----
+# ---- 8. Train ----
 model = AttentionModel(vocab_size, n_embd, block_size)
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
@@ -122,7 +176,7 @@ for step in range(steps):
 
 print(f"final loss: {loss.item():.4f}")
 
-# ---- 6. Generate sample text ----
+# ---- 9. Generate sample text ----
 context = torch.zeros((1, 1), dtype=torch.long)  # start with newline char
 generated = model.generate(context, max_new_tokens=300)
 print("\n--- sample output ---")
